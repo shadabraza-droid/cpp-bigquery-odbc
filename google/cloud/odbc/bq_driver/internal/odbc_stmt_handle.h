@@ -57,7 +57,13 @@ class StatementHandle : public Handle {
  public:
   // This constructor is used only for tests
   explicit StatementHandle(ConnectionHandle* conn_handle = nullptr)
-      : conn_handle_(conn_handle) {};
+      : conn_handle_(conn_handle),
+        descriptors_(
+            DescriptorHandle(DescriptorType::kARD, SQL_DESC_ALLOC_AUTO),
+            DescriptorHandle(DescriptorType::kAPD, SQL_DESC_ALLOC_AUTO),
+            DescriptorHandle(DescriptorType::kIRD, SQL_DESC_ALLOC_AUTO),
+            DescriptorHandle(DescriptorType::kIPD, SQL_DESC_ALLOC_AUTO)),
+        attributes_(kDefaultAttributes) {};
   explicit StatementHandle(ConnectionHandle* conn_handle,
                            Descriptors const& descriptors)
       : conn_handle_(conn_handle),
@@ -91,6 +97,8 @@ class StatementHandle : public Handle {
           job_statistics);
 
   odbc_internal::StatusRecord PrepareQuery(std::string const& query);
+  odbc_internal::StatusRecord ExecuteDryRun(std::string const& query);
+  odbc_internal::StatusRecord EnsureMetadataPrepared();
   HandleType kType = HandleType::kStmtHandle;
 
   inline ConnectionHandle* GetConnectionHandle() { return conn_handle_; };
@@ -370,6 +378,10 @@ class StatementHandle : public Handle {
   bool is_statement_prepared_ = false;
   PagingInfo paging_info_;
 };
+
+std::string GetLeadingKeyword(std::string const& q);
+
+bool HasMultipleStatements(std::string const& q);
 
 }  // namespace google::cloud::odbc_bq_driver_internal
 

@@ -180,17 +180,44 @@ StatusRecord StatementHandle::PopulateResultSet(TableSchema const& schema) {
 }
 
 std::string GetLeadingKeyword(std::string const& q) {
-  std::string s = q;
-  s.erase(0, s.find_first_not_of(" \t\n\r"));  // trim leading whitespace
+  size_t i = 0;
+  while (i < q.size()) {
+    // Skip whitespace
+    if (std::isspace(static_cast<unsigned char>(q[i]))) {
+      ++i;
+      continue;
+    }
+    // Skip single-line comments -- ...
+    if (i + 1 < q.size() && q[i] == '-' && q[i + 1] == '-') {
+      i += 2;
+      while (i < q.size() && q[i] != '\n' && q[i] != '\r') {
+        ++i;
+      }
+      continue;
+    }
+    // Skip multi-line comments /* ... */
+    if (i + 1 < q.size() && q[i] == '/' && q[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < q.size() && !(q[i] == '*' && q[i + 1] == '/')) {
+        ++i;
+      }
+      if (i + 1 < q.size()) {
+        i += 2;
+      }
+      continue;
+    }
+    break;
+  }
 
   // Extract first word
-  auto end = s.find_first_of(" \t\n\r;");
-  std::string keyword = s.substr(0, end);
-
-  // Convert to lowercase
+  size_t start = i;
+  while (i < q.size() &&
+         (std::isalnum(static_cast<unsigned char>(q[i])) || q[i] == '_')) {
+    ++i;
+  }
+  std::string keyword = q.substr(start, i - start);
   std::transform(keyword.begin(), keyword.end(), keyword.begin(),
                  [](unsigned char c) { return std::tolower(c); });
-
   return keyword;
 }
 
@@ -202,6 +229,92 @@ bool IsSelectQuery(std::string const& q) {
   return GetLeadingKeyword(q) == "select";
 }
 
+bool HasMultipleStatements(std::string const& q) {
+  bool in_single_quote = false;
+  bool in_double_quote = false;
+  bool in_backtick = false;
+  bool in_line_comment = false;
+  bool in_block_comment = false;
+  bool saw_semicolon = false;
+  size_t n = q.size();
+
+  for (size_t i = 0; i < n; ++i) {
+    char c = q[i];
+    if (in_line_comment) {
+      if (c == '\n') {
+        in_line_comment = false;
+      }
+      continue;
+    }
+    if (in_block_comment) {
+      if (c == '*' && i + 1 < n && q[i + 1] == '/') {
+        in_block_comment = false;
+        ++i;
+      }
+      continue;
+    }
+    if (in_single_quote) {
+      if (c == '\\' && i + 1 < n) {
+        ++i;
+      } else if (c == '\'') {
+        in_single_quote = false;
+      }
+      continue;
+    }
+    if (in_double_quote) {
+      if (c == '\\' && i + 1 < n) {
+        ++i;
+      } else if (c == '"') {
+        in_double_quote = false;
+      }
+      continue;
+    }
+    if (in_backtick) {
+      if (c == '\\' && i + 1 < n) {
+        ++i;
+      } else if (c == '`') {
+        in_backtick = false;
+      }
+      continue;
+    }
+
+    // Outside of quotes and comments:
+    if (c == '-' && i + 1 < n && q[i + 1] == '-') {
+      in_line_comment = true;
+      ++i;
+      continue;
+    }
+    if (c == '/' && i + 1 < n && q[i + 1] == '*') {
+      in_block_comment = true;
+      ++i;
+      continue;
+    }
+    if (c == '\'') {
+      in_single_quote = true;
+      if (saw_semicolon) return true;
+      continue;
+    }
+    if (c == '"') {
+      in_double_quote = true;
+      if (saw_semicolon) return true;
+      continue;
+    }
+    if (c == '`') {
+      in_backtick = true;
+      if (saw_semicolon) return true;
+      continue;
+    }
+    if (c == ';') {
+      saw_semicolon = true;
+      continue;
+    }
+    if (saw_semicolon && !std::isspace(static_cast<unsigned char>(c))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // TODO(b/342044533) Sanitize query text to avoid potential SQL Injection
 // risk.
 StatusRecord StatementHandle::PrepareQuery(std::string const& query) {
@@ -211,6 +324,35 @@ StatusRecord StatementHandle::PrepareQuery(std::string const& query) {
                << transaction_status.message;
     return transaction_status;
   }
+
+  std::string kw = GetLeadingKeyword(query);
+  bool is_simple_query =
+      (kw == "select" || kw == "with") && !HasMultipleStatements(query);
+  bool has_positional = !conn_handle_->GetDsn().is_bq_legacy_sql &&
+                        re2::RE2::PartialMatch(query, R"(\?)");
+  if (is_simple_query && !has_positional) {
+    query_str_ = query;
+    prepared_job_ = std::nullopt;
+    query_parameters_.clear();
+    result_set_.rows.clear();
+    result_set_.row_schema.clear();
+    result_set_.cursor = -1;
+    if (descriptors_.ird_ != nullptr) {
+      DescriptorHandle& ird = GetDescriptorHandle(DescriptorType::kIRD);
+      ird.SetConnectionHandle(conn_handle_);
+      ird.ClearDescriptorRecordsMap();
+    }
+    if (descriptors_.ipd_ != nullptr) {
+      DescriptorHandle& ipd = GetDescriptorHandle(DescriptorType::kIPD);
+      ipd.ClearDescriptorRecordsMap();
+    }
+    return StatusRecord::Ok();
+  }
+
+  return ExecuteDryRun(query);
+}
+
+StatusRecord StatementHandle::ExecuteDryRun(std::string const& query) {
   ConnectionHandle& conn_handle = *GetConnectionHandle();
 
   Job req;
@@ -272,14 +414,14 @@ StatusRecord StatementHandle::PrepareQuery(std::string const& query) {
   auto response = conn_handle.GetClient()->InsertJob(
       conn_handle.GetDsn().catalog, req, opt);
   if (!response.Ok()) {
-    LOG(ERROR) << "StatementHandle::PrepareQuery::InsertJob:: "
+    LOG(ERROR) << "StatementHandle::ExecuteDryRun::InsertJob:: "
                << response.GetStatusRecord().message;
     return response.GetStatusRecord();
   }
   auto& schema = response.GetValue().statistics.job_query_stats.schema;
   auto pop_response = PopulateResultSet(schema);
   if (!pop_response.ok()) {
-    LOG(ERROR) << "StatementHandle::PrepareQuery::PopulateResultSet:: "
+    LOG(ERROR) << "StatementHandle::ExecuteDryRun::PopulateResultSet:: "
                << pop_response.message;
     return pop_response;
   }
@@ -287,12 +429,6 @@ StatusRecord StatementHandle::PrepareQuery(std::string const& query) {
   SetQueryParameters(
       response.GetValue()
           .statistics.job_query_stats.undeclared_query_parameters);
-
-  if (!pop_response.ok()) {
-    LOG(ERROR) << "StatementHandle::PrepareQuery::PopulateResultSet:: "
-               << pop_response.message;
-    return pop_response;
-  }
 
   TableReference table_fields;
   auto table_ref =
@@ -310,7 +446,7 @@ StatusRecord StatementHandle::PrepareQuery(std::string const& query) {
   desc_handle.ClearDescriptorRecordsMap();
   StatusRecord ird_response = PopulateIrd(desc_handle, schema, table_fields);
   if (!ird_response.ok()) {
-    LOG(ERROR) << "StatementHandle::PrepareQuery::PopulateIrd:: "
+    LOG(ERROR) << "StatementHandle::ExecuteDryRun::PopulateIrd:: "
                << ird_response.message;
     return ird_response;
   }
@@ -321,7 +457,7 @@ StatusRecord StatementHandle::PrepareQuery(std::string const& query) {
   auto job_statistics = (*response).statistics;
   StatusRecord ipd_response = PopulateIpd(ipd_desc_handle, job_statistics);
   if (!ipd_response.ok()) {
-    LOG(ERROR) << "StatementHandle::PrepareQuery::PopulateIpd:: "
+    LOG(ERROR) << "StatementHandle::ExecuteDryRun::PopulateIpd:: "
                << ipd_response.message;
     return ipd_response;
   }
@@ -333,6 +469,16 @@ StatusRecord StatementHandle::PrepareQuery(std::string const& query) {
   query_str_ = query;
   prepared_job_ = *response;
   return StatusRecord::Ok();
+}
+
+StatusRecord StatementHandle::EnsureMetadataPrepared() {
+  if (prepared_job_.has_value()) {
+    return StatusRecord::Ok();
+  }
+  if (query_str_.empty()) {
+    return StatusRecord::Ok();
+  }
+  return ExecuteDryRun(query_str_);
 }
 
 StatusRecord StatementHandle::PopulateIrd(DescriptorHandle& descriptor_handle,

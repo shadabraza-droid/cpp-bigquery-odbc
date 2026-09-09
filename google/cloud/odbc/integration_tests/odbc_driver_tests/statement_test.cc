@@ -2201,11 +2201,23 @@ TEST(SQLPrepare, StatementFailure) {
 
   EXPECT_EQ(Connect(kDefaultConnectionString, conn), SQL_SUCCESS);
 
+  // Without positional parameters, dry run is removed during SQLPrepare.
+  // The query succeeds at prepare and fails at execute.
   std::string query = "Select * from NON_EXISTENT_TABLE";
   char read_stmt[kBufferLength];
   StrToChar(read_stmt, query);
 
   auto status = SQLPrepare(conn->hstmt, (SQLCHAR*)read_stmt, strlen(read_stmt));
+  EXPECT_EQ(SQL_SUCCESS, status);
+  status = SQLExecute(conn->hstmt);
+  EXPECT_EQ(SQL_ERROR, status);
+
+  // With positional parameters, dry run is still performed during SQLPrepare.
+  std::string param_query = "Select * from NON_EXISTENT_TABLE WHERE id = ?";
+  char param_stmt[kBufferLength];
+  StrToChar(param_stmt, param_query);
+
+  status = SQLPrepare(conn->hstmt, (SQLCHAR*)param_stmt, strlen(param_stmt));
   EXPECT_EQ(SQL_ERROR, status);
 
   EXPECT_EQ(Disconnect(conn), SQL_SUCCESS);
@@ -3283,8 +3295,11 @@ TEST(SQLMoreResults, ErrorHandling) {
   std::string query = "SELECT * FROM " + table_name;
   SQLRETURN prep_result =
       SQLPrepare(conn->hstmt, (SQLCHAR*)query.c_str(), query.size());
+  EXPECT_EQ(prep_result, SQL_SUCCESS);
 
-  EXPECT_EQ(prep_result, SQL_ERROR);
+  SQLRETURN exec_result = SQLExecute(conn->hstmt);
+  EXPECT_EQ(exec_result, SQL_ERROR);
+
   // After execution failure, check for more results, which should not be
   // applicable
   EXPECT_EQ(SQLMoreResults(conn->hstmt),
